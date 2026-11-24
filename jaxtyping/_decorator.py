@@ -22,6 +22,7 @@ import functools as ft
 import inspect
 import itertools as it
 import sys
+import types
 import warnings
 import weakref
 from collections.abc import Callable
@@ -29,11 +30,13 @@ from contextlib import AbstractContextManager
 from typing import (
     Any,
     get_args,
+    get_origin,
     get_type_hints,
     Literal,
     NoReturn,
     overload,
     ParamSpec,
+    Self,
     TypeVar,
     Union,
 )
@@ -42,7 +45,10 @@ from jaxtyping import AbstractArray
 
 from ._config import config
 from ._errors import AnnotationError, TypeCheckError
-from ._storage import pop_shape_memo, push_shape_memo, shape_str
+from ._storage import get_shape_memo, pop_shape_memo, push_shape_memo, shape_str
+
+
+_union_types = (Union, types.UnionType)
 
 
 _Params = ParamSpec("_Params")
@@ -397,11 +403,13 @@ def jaxtyped(fn=_sentinel, *, typechecker=_sentinel):
             new_params = []
             for p_value in full_signature.parameters.values():
                 p_annotation = _destring_annotation(p_value.annotation, fn.__globals__)
+                p_annotation = _substitute_self(p_annotation)
                 p_value = p_value.replace(annotation=p_annotation)
                 new_params.append(p_value)
             return_annotation = _destring_annotation(
                 full_signature.return_annotation, fn.__globals__
             )
+            return_annotation = _substitute_self(return_annotation)
             full_signature = full_signature.replace(
                 parameters=new_params, return_annotation=return_annotation
             )
@@ -553,6 +561,73 @@ class _JaxtypingContext:
 
     def __exit__(self, exc_type, exc_value, exc_tb):
         pop_shape_memo()
+
+
+class _MetaSelf(type):
+    """Metaclass for `_Self`, which `typing.Self` annotations are replaced with.
+
+    The annotations of a `jaxtyped` function are moved onto a separately-created
+    function, so the typechecker no longer knows which class a method belongs to, and
+    cannot check `Self` itself. Instead we look up the first argument (`self` or `cls`)
+    of the current call from the shape memo.
+    """
+
+    def _self_type(cls):
+        *_, arguments = get_shape_memo()
+        for value in arguments.values():
+            return value if isinstance(value, type) else type(value)
+        return None
+
+    def __instancecheck__(cls, obj) -> bool:
+        self_type = cls._self_type()
+        return self_type is not None and isinstance(obj, self_type)
+
+    def __subclasscheck__(cls, subclass) -> bool:
+        self_type = cls._self_type()
+        return (
+            self_type is not None
+            and isinstance(subclass, type)
+            and issubclass(subclass, self_type)
+        )
+
+    def __repr__(cls):
+        return "Self"
+
+
+class _Self(metaclass=_MetaSelf):
+    pass
+
+
+# Match `__repr__` so PEP 604 unions format as `Self | ...`, which beartype checks for
+# repr consistency.
+_Self.__name__ = "Self"
+_Self.__qualname__ = "Self"
+_Self.__module__ = "builtins"
+
+
+def _substitute_self(annotation):
+    """Replaces every `Self` in `annotation` with `_Self`."""
+    if annotation is Self:
+        return _Self
+    if isinstance(annotation, list):  # E.g. the arguments of `Callable[[Self], int]`.
+        new_list = [_substitute_self(a) for a in annotation]
+        if all(a is b for a, b in zip(annotation, new_list)):
+            return annotation
+        return new_list
+    args = get_args(annotation)
+    if len(args) == 0:
+        return annotation
+    new_args = tuple(_substitute_self(a) for a in args)
+    if all(a is b for a, b in zip(args, new_args)):
+        return annotation
+    origin = get_origin(annotation)
+    if origin in _union_types:
+        return Union[new_args]
+    try:
+        return origin[new_args]
+    except TypeError:
+        # Some annotation we don't know how to rebuild. Leave it unchanged.
+        return annotation
 
 
 def _destring_annotation(ann, ns):

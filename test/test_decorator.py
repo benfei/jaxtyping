@@ -1,7 +1,7 @@
 import abc
 import dataclasses
 import sys
-from typing import no_type_check
+from typing import no_type_check, Optional, Self
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -342,3 +342,46 @@ def test_stringified_forward_annotation():
     bar = _GlobalBar()
     bar.returns_self()
     bar.returns_tuple()
+
+
+def test_self(typecheck):
+    class A:
+        @jaxtyped(typechecker=typecheck)
+        def same(self) -> Self:
+            return self
+
+        @jaxtyped(typechecker=typecheck)
+        def other(self, x: object) -> Self:
+            return x  # pyright: ignore
+
+        @jaxtyped(typechecker=typecheck)
+        def maybe(self, x: Optional[Self]) -> list[Self]:
+            return [self] if x is None else [self, x]
+
+        @classmethod
+        @jaxtyped(typechecker=typecheck)
+        def create(cls, make_wrong: bool) -> Self:
+            return object() if make_wrong else cls()  # pyright: ignore
+
+    class B(A):
+        pass
+
+    a = A()
+    b = B()
+    assert a.same() is a
+    assert b.same() is b
+    a.other(b)  # B is a subclass of A.
+    with pytest.raises(ReturnError):
+        a.other(object())
+    with pytest.raises(ReturnError):
+        # `Self` is the type of `self`, so here `B`, not `A`.
+        b.other(a)
+    assert len(a.maybe(None)) == 1
+    assert len(a.maybe(b)) == 2
+    with pytest.raises(ParamError):
+        a.maybe(object())
+    with pytest.raises(ParamError):
+        b.maybe(a)
+    assert type(B.create(False)) is B
+    with pytest.raises(ReturnError):
+        A.create(True)
